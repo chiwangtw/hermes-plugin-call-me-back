@@ -57,8 +57,22 @@ agents. Same-machine setups work too (`host: local`). tmux is not supported yet.
 ### 1. Hermes machine
 
 ```sh
-hermes plugins install chiwangtw/hermes-plugin-call-me-back --enable
+hermes plugins install chiwangtw/hermes-plugin-call-me-back --enable --force
 ```
+
+Hermes scans community plugins before installing and gives this one a *caution* verdict; without
+`--force` (or a confirmation at the prompt) the install is blocked. Review the findings — they are what the
+plugin is for:
+
+- **obfuscation** (`remote.py`, `docs/adr/0007`): commands for the execution machine travel base64-encoded on
+  the ssh command line (`printf %s … | base64 -d | /bin/sh`). This is transport, not hiding: Windows
+  re-quotes command lines (breaking quotes and non-ASCII text) and Windows OpenSSH hangs when its stdin or
+  stdout is a pipe. The decoded script is always built from `shlex`-quoted arguments.
+- **execution** (`remote.py`): the tools run `ssh`/`orca` as subprocesses.
+- **network** (`__init__.py`): notifications are POSTed to Hermes' own webhook listener on `127.0.0.1`.
+- **persistence** (`machine/`): the execution-machine installer adds hooks to Claude Code / Codex settings
+  and a pi extension — the adapters that report stops.
+- **supply_chain** (`README.md`): the `git clone` in the instructions below.
 
 Add to `config.yaml`:
 
