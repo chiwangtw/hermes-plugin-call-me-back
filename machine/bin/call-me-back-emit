@@ -1,0 +1,168 @@
+#!/bin/bash
+# call-me-back-emit — turn one executor signal into a stop event, spool it, and send it in the background.
+# Contract: machine/CONTRACT.md. Always exits 0 and prints nothing, so it is safe inside any agent hook.
+#
+#   call-me-back-emit --executor E --reason R [--agent-session ID] [--cwd DIR] [--exit-code N] [--detail T] [--message-stdin]
+#   call-me-back-emit --flush
+#   call-me-back-emit --forget TASK
+
+CONFIG="${CALL_ME_BACK_CONFIG:-$HOME/.config/call-me-back/machine.env}"
+env_receive="${CALL_ME_BACK_RECEIVE-}"
+# shellcheck disable=SC1090
+[ -f "$CONFIG" ] && . "$CONFIG"
+[ -n "$env_receive" ] && CALL_ME_BACK_RECEIVE="$env_receive"   # the environment wins over the file
+
+STATE_DIR="${CALL_ME_BACK_STATE_DIR:-$HOME/.local/state/call-me-back}"
+SPOOL="$STATE_DIR/spool"
+BINDINGS="$STATE_DIR/bindings"
+LOG="$STATE_DIR/emit.log"
+LOCK="$STATE_DIR/flush.lock"
+RECEIVE="${CALL_ME_BACK_RECEIVE:-hermes call-me-back receive}"
+SEND_TIMEOUT="${CALL_ME_BACK_SEND_TIMEOUT:-90}"
+RETRY_FOR="${CALL_ME_BACK_RETRY_FOR:-7200}"   # seconds a background flush keeps retrying a dead link
+MAX_MSG=3000
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+now_iso() { date '+%Y-%m-%dT%H:%M:%S%z' | sed -E 's/([0-9]{2})$/:\1/'; }
+safe() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-80; }
+oneline() { tr '\r\n\t' '   ' | cut -c1-200; }
+file_size() { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0; }
+file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || date +%s; }
+
+log() {
+  mkdir -p "$STATE_DIR"
+  printf '%s %s\n' "$(now_iso)" "$*" >> "$LOG"
+  if [ "$(file_size "$LOG")" -gt 1048576 ]; then
+    tail -n 2000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+  fi
+}
+
+# ---------------------------------------------------------------- flush
+send_one() {
+  # $1 = spool file. Exit code of the receiver (or 142 when the watchdog kills it); output in $RESP.
+  RESP=$(perl -e 'alarm shift; exec @ARGV' "$SEND_TIMEOUT" /bin/sh -c "$RECEIVE" < "$1" 2>&1)
+}
+
+flush() {
+  local f id rc age
+  mkdir -p "$SPOOL"
+  # oldest first, so a resend never overtakes a newer event
+  for f in $(ls -tr "$SPOOL" 2>/dev/null | grep '\.json$'); do
+    f="$SPOOL/$f"
+    [ -f "$f" ] || continue
+    id=$(basename "$f" .json)
+    age=$(( $(date +%s) - $(file_mtime "$f") ))
+    send_one "$f"; rc=$?
+    case $rc in
+      0) rm -f "$f"; log "delivered id=$id age=${age}s" ;;
+      2) mv "$f" "$f.rejected"; log "rejected id=$id resp=\"$(printf '%s' "$RESP" | oneline)\"" ;;
+      *) log "fail id=$id rc=$rc resp=\"$(printf '%s' "$RESP" | oneline)\" pending=$(ls "$SPOOL" | grep -c '\.json$')"
+         return 1 ;;
+    esac
+  done
+  return 0
+}
+
+with_lock() {
+  # Run "$@" under an exclusive lock (lockf on macOS, flock on Linux, otherwise unlocked). A short wait is
+  # enough: whoever holds the lock re-lists the spool on every pass, so it also sends our event.
+  mkdir -p "$STATE_DIR"
+  if command -v flock >/dev/null 2>&1; then
+    flock -w 30 "$LOCK" "$@"
+  elif command -v lockf >/dev/null 2>&1; then
+    lockf -k -t 30 "$LOCK" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Keep retrying with backoff: the Session's last stop may be the one that could not be sent, and no later
+# stop would come to flush it. Newer emits wait on the lock meanwhile; their events are sent by this loop.
+flush_until_empty() {
+  local wait=15 deadline=$(( $(date +%s) + RETRY_FOR ))
+  until flush; do
+    [ "$(date +%s)" -lt "$deadline" ] || { log "give-up-flush pending=$(ls "$SPOOL" | grep -c '\.json$') (next emit retries)"; return 1; }
+    sleep "$wait"
+    wait=$(( wait * 2 )); [ "$wait" -gt 300 ] && wait=300
+  done
+}
+
+case "${1-}" in
+  --flush) flush; exit 0 ;;
+  --flush-retry) flush_until_empty; exit 0 ;;
+  --flush-locked) with_lock "$SELF" --flush-retry; exit 0 ;;
+  --forget)
+    task="${2-}"
+    [ -n "$task" ] || exit 0
+    grep -rlxF -- "$task" "$BINDINGS" 2>/dev/null | while read -r b; do rm -f "$b"; done
+    rm -f "$STATE_DIR/prompts/$task.txt"
+    log "forget task=$task"
+    exit 0 ;;
+esac
+
+# ---------------------------------------------------------------- emit
+executor= reason= agent_session= cwd= exit_code= detail= read_msg=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --executor) executor="$2"; shift 2 ;;
+    --reason) reason="$2"; shift 2 ;;
+    --agent-session) agent_session="$2"; shift 2 ;;
+    --cwd) cwd="$2"; shift 2 ;;
+    --exit-code) exit_code="$2"; shift 2 ;;
+    --detail) detail="$2"; shift 2 ;;
+    --message-stdin) read_msg=1; shift ;;
+    *) shift ;;
+  esac
+done
+case "$executor" in claude-code|codex|pi) ;; *) exit 0 ;; esac
+case "$reason" in turn_end|needs_approval|session_exit) ;; *) exit 0 ;; esac
+# An agent started inside a dispatched Session inherits its environment (e.g. pi's Claude bridge spawns
+# Claude Code, whose global hooks then fire). Only the executor the wrapper started speaks for the Task.
+if [ -n "${CALL_ME_BACK_EXECUTOR-}" ] && [ "$CALL_ME_BACK_EXECUTOR" != "$executor" ]; then
+  [ -n "$read_msg" ] && cat >/dev/null
+  exit 0
+fi
+
+# The message goes to jq as a file: as one argv entry it fails past ~128 KB (Linux) or ~1 MB (macOS).
+msg_file=$(mktemp "${TMPDIR:-/tmp}/call-me-back-msg.XXXXXX") || exit 0
+trap 'rm -f "$msg_file"' EXIT
+[ -n "$read_msg" ] && cat > "$msg_file"
+
+binding=""
+[ -n "$agent_session" ] && binding="$BINDINGS/$executor/$(safe "$agent_session")"
+
+task="${CALL_ME_BACK_TASK-}"
+if [ -n "$task" ]; then
+  if [ -n "$binding" ] && [ "$(cat "$binding" 2>/dev/null)" != "$task" ]; then
+    mkdir -p "$(dirname "$binding")" && printf '%s\n' "$task" > "$binding"
+  fi
+elif [ -n "$binding" ] && [ -f "$binding" ]; then
+  task=$(head -n 1 "$binding")
+fi
+[ -n "$task" ] || exit 0
+
+[ -n "$cwd" ] || cwd=$PWD
+id="$executor-$(safe "${agent_session:-wrapper}" | cut -c1-40)-$(date +%Y%m%d%H%M%S)-$$"
+
+mkdir -p "$SPOOL"
+tmp="$SPOOL/.$id.tmp"
+if ! jq -n --arg id "$id" --arg task "$task" --arg executor "$executor" --arg reason "$reason" \
+      --arg agent_session "$agent_session" --arg machine "$(hostname -s 2>/dev/null || hostname)" \
+      --arg cwd "$cwd" --arg ts "$(now_iso)" --arg exit_code "$exit_code" --arg detail "$detail" \
+      --rawfile msg "$msg_file" --argjson max "$MAX_MSG" '
+      {v: 1, id: $id, task: $task, executor: $executor, reason: $reason,
+       agent_session: $agent_session, machine: $machine, cwd: $cwd, ts: $ts,
+       exit_code: (if $exit_code == "" then null else ($exit_code | tonumber? // null) end),
+       detail: $detail,
+       last_message: (if ($msg | length) > $max then $msg[0:($max - 13)] + "\n…[truncated]" else $msg end)}' \
+      > "$tmp" 2>/dev/null; then
+  rm -f "$tmp"
+  log "error id=$id task=$task could not build JSON"
+  exit 0
+fi
+mv "$tmp" "$SPOOL/$id.json"
+log "queued id=$id task=$task executor=$executor reason=$reason session=$agent_session msg_bytes=$(wc -c < "$msg_file" | tr -d ' ')"
+
+# detach from the agent's process group so the agent never waits on the network
+perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' "$SELF" --flush-locked </dev/null >/dev/null 2>&1 &
+exit 0

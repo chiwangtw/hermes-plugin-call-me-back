@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.local/share/call-me-back/adapters/claude-code/hook.sh" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.local/share/call-me-back/adapters/claude-code/hook.sh" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.local/share/call-me-back/adapters/claude-code/hook.sh" } ] }
+    ]
+  }
+}

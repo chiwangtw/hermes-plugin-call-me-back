@@ -1,0 +1,59 @@
+#!/bin/bash
+# call-me-back-run — start a dispatched agent bound to a Task, and report its exit.
+#
+#   call-me-back-run --task T --executor E [--prompt-file F] -- <agent command…>
+#
+# Exports CALL_ME_BACK_TASK / CALL_ME_BACK_WRAPPED so the agent's hooks treat this Session as tracked,
+# appends the prompt file's content as the agent's last argument, and emits a session_exit event when
+# the agent ends for any reason (normal exit, crash, or the terminal being closed). Contract: machine/CONTRACT.md.
+
+CONFIG="${CALL_ME_BACK_CONFIG:-$HOME/.config/call-me-back/machine.env}"
+env_receive="${CALL_ME_BACK_RECEIVE-}"
+# shellcheck disable=SC1090
+[ -f "$CONFIG" ] && . "$CONFIG"
+[ -n "$env_receive" ] && CALL_ME_BACK_RECEIVE="$env_receive"   # the environment wins over the file
+EMIT="${CALL_ME_BACK_EMIT:-$(cd "$(dirname "$0")" && pwd)/call-me-back-emit}"
+
+task= executor= prompt_file=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --task) task="$2"; shift 2 ;;
+    --executor) executor="$2"; shift 2 ;;
+    --prompt-file) prompt_file="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) echo "call-me-back-run: unknown option $1" >&2; exit 64 ;;
+  esac
+done
+if [ -z "$task" ] || [ -z "$executor" ] || [ $# -eq 0 ]; then
+  echo "usage: call-me-back-run --task T --executor E [--prompt-file F] -- <agent command…>" >&2
+  exit 64
+fi
+
+cmd=("$@")
+if [ -n "$prompt_file" ]; then
+  if [ ! -r "$prompt_file" ]; then echo "call-me-back-run: cannot read $prompt_file" >&2; exit 66; fi
+  if [ "$(wc -c < "$prompt_file")" -gt 100000 ]; then
+    # Too big for one argv entry (Linux caps it at 128 KB): let the agent read it instead.
+    cmd+=("Read the file $(cd "$(dirname "$prompt_file")" && pwd)/$(basename "$prompt_file") and follow the instructions in it.")
+  else
+    cmd+=("$(cat "$prompt_file")")
+  fi
+fi
+
+# CALL_ME_BACK_EMIT: adapters find emit even when ~/.local/bin is not on the agent's PATH.
+export CALL_ME_BACK_TASK="$task" CALL_ME_BACK_WRAPPED=1 CALL_ME_BACK_EXECUTOR="$executor" CALL_ME_BACK_EMIT="$EMIT"
+
+report_exit() {
+  printf 'agent process ended (exit code %s%s)' "$1" "${2:+, $2}" |
+    "$EMIT" --executor "$executor" --reason session_exit --cwd "$PWD" --exit-code "$1" --detail "${2:-exit}" --message-stdin
+}
+
+# The agent must stay in the foreground: a TUI started with `&` would lose the terminal (stdin, SIGTTIN).
+# Traps here are no-ops, so the agent keeps default signal handling; bash runs them after the agent ends.
+hup=
+trap 'hup=1' HUP
+trap ':' INT TERM
+"${cmd[@]}"
+rc=$?
+if [ -n "$hup" ]; then report_exit "$rc" "terminal closed"; else report_exit "$rc"; fi
+exit "$rc"

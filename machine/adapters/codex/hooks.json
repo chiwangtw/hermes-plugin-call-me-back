@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "\"$HOME/.local/share/call-me-back/adapters/codex/hook.sh\"", "timeout": 10 } ] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "\"$HOME/.local/share/call-me-back/adapters/codex/hook.sh\"", "timeout": 10 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "\"$HOME/.local/share/call-me-back/adapters/codex/hook.sh\"", "timeout": 3 } ] }
+    ]
+  }
+}

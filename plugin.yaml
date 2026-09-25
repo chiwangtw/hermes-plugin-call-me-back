@@ -1,0 +1,13 @@
+name: call-me-back
+version: 0.1.0
+description: "Dispatch work to Claude Code, Codex or pi sessions from Hermes; every time a dispatched session stops, you get a notification and the dispatching conversation is woken up to take over."
+author: Chi Wang
+license: MIT
+kind: standalone
+provides_tools:
+  - call_me_back_list
+  - call_me_back_read
+  - call_me_back_send
+  - call_me_back_dispatch
+  - call_me_back_tasks
+  - call_me_back_close
